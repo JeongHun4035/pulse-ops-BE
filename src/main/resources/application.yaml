@@ -1,0 +1,36 @@
+server:
+  address: ${SERVER_ADDRESS:0.0.0.0}
+  port: ${SERVER_PORT:8080}
+spring:
+  application:
+    name: pulseops-be
+  profiles:
+    default: local
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:${DB_URL:jdbc:postgresql://localhost:5432/pulseops}}
+    username: ${SPRING_DATASOURCE_USERNAME:${DB_USERNAME:pulseops}}
+    password: ${SPRING_DATASOURCE_PASSWORD:${DB_PASSWORD:pulseops-local}}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  jackson:
+    time-zone: UTC
+    deserialization:
+      fail-on-unknown-properties: true
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+pulseops:
+  cors-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:3000}
+  timeout-seconds: ${HTTP_TIMEOUT_SECONDS:5}
