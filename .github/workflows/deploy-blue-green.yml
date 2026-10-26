@@ -1,0 +1,183 @@
+﻿name: PulseOps Backend Blue-Green Deployment
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: pulseops-backend-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  EKS_CLUSTER: pulseops-eks
+  K8S_NAMESPACE: pulseops
+  ECR_REPOSITORY: pulseops/backend
+  ECR_REGISTRY: 699414615096.dkr.ecr.ap-northeast-2.amazonaws.com
+  AWS_ROLE_ARN: arn:aws:iam::699414615096:role/PulseOpsGitHubActionsRole
+  GATEWAY_URL: k8s-pulseops-pulseops-3cd7bee98d-2104214011.ap-northeast-2.elb.amazonaws.com
+
+jobs:
+  deploy:
+    name: Test, Build and Deploy Blue-Green
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Run tests
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon test
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER" \
+            --region "$AWS_REGION"
+
+      - name: Deploy, validate and switch traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTIVE_VERSION=$(kubectl get svc pulseops-backend \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.selector.version}')
+
+          if [[ "$ACTIVE_VERSION" == "blue" ]]; then
+            TARGET_VERSION="green"
+            TARGET_DEPLOYMENT="pulseops-backend-green"
+            TARGET_SERVICE="pulseops-backend-green"
+            ACTIVE_DEPLOYMENT="pulseops-backend"
+          elif [[ "$ACTIVE_VERSION" == "green" ]]; then
+            TARGET_VERSION="blue"
+            TARGET_DEPLOYMENT="pulseops-backend"
+            TARGET_SERVICE="pulseops-backend"
+            ACTIVE_DEPLOYMENT="pulseops-backend-green"
+          else
+            echo "Unknown active version: $ACTIVE_VERSION"
+            exit 1
+          fi
+
+          echo "Active: $ACTIVE_VERSION"
+          echo "Deploying to: $TARGET_VERSION"
+
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          kubectl set image "deployment/$TARGET_DEPLOYMENT" \
+            backend="$IMAGE" \
+            -n "$K8S_NAMESPACE"
+
+          kubectl rollout status "deployment/$TARGET_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=300s
+
+          
+          POD="backend-validation-${GITHUB_RUN_ID}"
+
+          cleanup() {
+            kubectl delete pod "$POD" -n "$K8S_NAMESPACE" \
+              --ignore-not-found --wait=false
+          }
+          trap cleanup EXIT
+
+          # 현재 운영 Service가 아니라 신규 버전 Pod를 직접 검사
+          TARGET_POD_IP=$(kubectl get pods \
+            -n "$K8S_NAMESPACE" \
+            -l "app=pulseops-backend,version=${TARGET_VERSION}" \
+            -o jsonpath='{.items[0].status.podIP}')
+
+          if [[ -z "$TARGET_POD_IP" ]]; then
+            echo "Target Pod IP not found"
+            exit 1
+          fi
+
+          kubectl run "$POD" \
+            -n "$K8S_NAMESPACE" \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --command -- sh -ec \
+            "curl -fsS --max-time 15 http://${TARGET_POD_IP}:8080/actuator/health/readiness >/dev/null &&
+            curl -fsS --max-time 15 http://${TARGET_POD_IP}:8080/api/v1/sites >/dev/null"
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            "pod/$POD" -n "$K8S_NAMESPACE" \
+            --timeout=120s
+
+          kubectl logs "$POD" -n "$K8S_NAMESPACE"
+          cleanup
+          trap - EXIT
+
+
+          # Switch production traffic only after validation.
+          kubectl patch svc pulseops-backend \
+            -n "$K8S_NAMESPACE" --type=merge \
+            -p "{\"spec\":{\"selector\":{\"app\":\"pulseops-backend\",\"version\":\"${TARGET_VERSION}\"}}}"
+
+          # Keep HPA attached to the active backend deployment.
+          kubectl patch hpa pulseops-backend \
+            -n "$K8S_NAMESPACE" --type=merge \
+            -p "{\"spec\":{\"scaleTargetRef\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"name\":\"${TARGET_DEPLOYMENT}\"}}}"
+
+          if ! curl -fsS --retry 5 --retry-all-errors \
+            --retry-delay 3 --max-time 15 \
+            "http://${GATEWAY_URL}/api/v1/sites" -o /dev/null; then
+
+            echo "External API check failed; rolling back."
+
+            kubectl patch svc pulseops-backend \
+              -n "$K8S_NAMESPACE" --type=merge \
+              -p "{\"spec\":{\"selector\":{\"app\":\"pulseops-backend\",\"version\":\"${ACTIVE_VERSION}\"}}}"
+
+            kubectl patch hpa pulseops-backend \
+              -n "$K8S_NAMESPACE" --type=merge \
+              -p "{\"spec\":{\"scaleTargetRef\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"name\":\"${ACTIVE_DEPLOYMENT}\"}}}"
+
+            exit 1
+          fi
+
+          echo "Backend Blue-Green deployment succeeded."
+
+      - name: Show deployment state
+        if: always()
+        run: |
+          kubectl get deployments,services,hpa \
+            -n "$K8S_NAMESPACE" || true
+
